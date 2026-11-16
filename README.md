@@ -1,6 +1,6 @@
 # meeting-transcribe
 
-Локальное распознавание записей встреч на русском языке с разметкой участников. Работает полностью на CPU, аудио не покидает машину.
+Локальное распознавание записей встреч на русском языке с разметкой участников. Работает полностью на CPU и офлайн: скрипт не обращается к сети, аудио не покидает машину.
 
 Стек: [GigaAM-v3](https://github.com/salute-developers/GigaAM) для распознавания речи и [pyannote.audio](https://github.com/pyannote/pyannote-audio) для диаризации (определения говорящих). Результат сохраняется в формате SRT.
 
@@ -11,6 +11,7 @@
 - Приём любого аудио- или видеоформата, который поддерживает ffmpeg (m4a, mp3, wav, mp4, webm и др.)
 - Обработка длинных записей без ограничения по длительности
 - Работа без GPU
+- Работа без сети: веса моделей загружаются один раз при установке
 
 ## Как это работает
 
@@ -35,10 +36,12 @@ ffmpeg ──► WAV 16 кГц, моно
 
 - Python 3.10 или новее
 - [ffmpeg](https://ffmpeg.org/) в `PATH`
-- Аккаунт и токен [Hugging Face](https://huggingface.co/settings/tokens) с правами read
-- Принятые условия доступа к моделям pyannote:
-  - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-  - [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+- Для однократной загрузки моделей при установке:
+  - доступ в интернет;
+  - аккаунт и токен [Hugging Face](https://huggingface.co/settings/tokens) с правами read;
+  - принятые условия доступа к моделям pyannote:
+    - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+    - [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
 
 ## Установка
 
@@ -66,14 +69,56 @@ sudo apt install ffmpeg
 brew install ffmpeg
 ```
 
-При первом запуске веса моделей скачиваются с Hugging Face и кешируются локально (`~/.cache`). Дальнейшая работа сети не требует.
+### Загрузка моделей
+
+Скрипт не скачивает модели сам и работает только с папкой `models/` в корне проекта. Загрузите веса один раз из корня проекта при активированном venv.
+
+Модели диаризации pyannote (нужен токен Hugging Face):
+
+```bash
+export HF_TOKEN=hf_xxx
+HF_HOME=models/huggingface hf download pyannote/speaker-diarization-community-1
+HF_HOME=models/huggingface hf download pyannote/segmentation-3.0
+unset HF_TOKEN
+```
+
+Модель распознавания GigaAM `v3_e2e_rnnt` (по умолчанию):
+
+```bash
+mkdir -p models/gigaam
+curl -L -o models/gigaam/v3_e2e_rnnt.ckpt https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_rnnt.ckpt
+curl -L -o models/gigaam/v3_e2e_rnnt_tokenizer.model https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_rnnt_tokenizer.model
+```
+
+Модель GigaAM `v3_e2e_ctc` (только если планируете использовать быстрый режим):
+
+```bash
+curl -L -o models/gigaam/v3_e2e_ctc.ckpt https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_ctc.ckpt
+curl -L -o models/gigaam/v3_e2e_ctc_tokenizer.model https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_ctc_tokenizer.model
+```
+
+Ожидаемая структура:
+
+```
+models/
+├── gigaam/
+│   ├── v3_e2e_rnnt.ckpt
+│   └── v3_e2e_rnnt_tokenizer.model
+└── huggingface/
+    └── hub/
+        ├── models--pyannote--segmentation-3.0/
+        └── models--pyannote--speaker-diarization-community-1/
+```
+
+Папку `models/` можно перенести на другую машину без доступа в интернет: скрипт найдёт её рядом с собой или по пути из `--models-dir`. Целостность весов GigaAM проверяется по контрольной сумме при загрузке модели.
 
 ## Использование
 
 ```bash
-export HF_TOKEN=hf_xxx
 python meeting_transcribe.py meeting.m4a
 ```
+
+Токен Hugging Face для запуска не нужен. Скрипт принудительно включает офлайн-режим (`HF_HUB_OFFLINE=1`), отключает телеметрию pyannote и завершается с подсказкой, если каких-то моделей нет в `models/`.
 
 По умолчанию результат сохраняется рядом с входным файлом: `meeting.srt`.
 
@@ -84,6 +129,7 @@ python meeting_transcribe.py meeting.m4a
 | `input` | Путь к аудио- или видеофайлу | — |
 | `-o`, `--output` | Путь к выходному `.srt` | рядом с входным файлом |
 | `--model` | `v3_e2e_rnnt` (точнее) или `v3_e2e_ctc` (быстрее) | `v3_e2e_rnnt` |
+| `--models-dir` | Папка с весами моделей | `models/` рядом со скриптом |
 | `--num-speakers` | Точное число участников | автоопределение |
 | `--min-speakers` | Минимальное число участников | — |
 | `--max-speakers` | Максимальное число участников | — |
@@ -133,8 +179,10 @@ python meeting_transcribe.py interview.wav --model v3_e2e_ctc --threads 8
 
 | Симптом | Причина и решение |
 |---|---|
-| `Не задан HF_TOKEN` | Экспортируйте токен: `export HF_TOKEN=hf_xxx` |
-| `401` / `403` при загрузке pyannote | Не приняты условия доступа к моделям pyannote на Hugging Face |
+| `Модель pyannote/... не найдена` | Не выполнен шаг «Загрузка моделей» или указан неверный `--models-dir` |
+| `В models/gigaam нет файлов` | Скачайте файлы `.ckpt` и `_tokenizer.model` для выбранной `--model` |
+| `Model checksum failed` | Файл GigaAM скачан не полностью: удалите его и скачайте заново |
+| `401` / `403` при `hf download` | Не задан `HF_TOKEN` или не приняты условия доступа к моделям pyannote на Hugging Face |
 | `FileNotFoundError: ffmpeg` | ffmpeg не установлен или отсутствует в `PATH` |
 | Все реплики отнесены к одному спикеру | Задайте `--num-speakers` или `--min-speakers 2` |
 | Конфликт версий torch | Установите зафиксированные версии `torch==2.10.*`, `torchaudio==2.10.*` в чистом venv |
@@ -144,6 +192,7 @@ python meeting_transcribe.py interview.wav --model v3_e2e_ctc --threads 8
 ```
 meeting-transcribe/
 ├── meeting_transcribe.py   # основной скрипт
+├── models/                 # веса моделей (загружаются вручную, не хранятся в git)
 ├── README.md
 └── LICENSE
 ```
