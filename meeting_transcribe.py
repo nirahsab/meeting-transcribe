@@ -2,6 +2,9 @@
 """
 Локальное распознавание записи встречи.
 
+Скрипт работает полностью офлайн и ничего не скачивает: веса моделей
+заранее загружаются в папку models/ по инструкции из README.
+
 Пайплайн:
   1. ffmpeg -> WAV 16 кГц моно
   2. pyannote (speaker-diarization-community-1) -> кто и когда говорит
@@ -10,7 +13,6 @@
   5. Вывод в SRT: "[Спикер N] текст"
 
 Запуск:
-  export HF_TOKEN=hf_xxx
   python meeting_transcribe.py meeting.m4a -o meeting.srt --max-speakers 6
 """
 
@@ -25,6 +27,9 @@ from pathlib import Path
 
 SAMPLE_RATE = 16000
 DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+VAD_MODEL = "pyannote/segmentation-3.0"  # используется GigaAM в transcribe_longform
+GIGAAM_MODELS = ("v3_e2e_rnnt", "v3_e2e_ctc")
+DEFAULT_MODELS_DIR = Path(__file__).resolve().parent / "models"
 
 
 @dataclass
@@ -58,15 +63,45 @@ def srt_time(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def setup_offline(models_dir: Path) -> None:
+    """Запрет сетевых обращений. Вызывать до импорта torch/pyannote/gigaam."""
+    os.environ["HF_HOME"] = str(models_dir / "huggingface")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["PYANNOTE_METRICS_ENABLED"] = "0"  # телеметрия pyannote
+    os.environ.pop("HF_TOKEN", None)              # исключает загрузку внутри GigaAM
+
+
+def hf_snapshot(repo_id: str) -> Path:
+    """Локальный путь к модели Hugging Face; без сети."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        return Path(snapshot_download(repo_id=repo_id, local_files_only=True))
+    except LocalEntryNotFoundError:
+        sys.exit(f"Модель {repo_id} не найдена в {os.environ['HF_HOME']}. "
+                 "Скачайте её по инструкции из README (раздел «Загрузка моделей»).")
+
+
+def check_gigaam(models_dir: Path, model_name: str) -> Path:
+    root = models_dir / "gigaam"
+    missing = [f for f in (f"{model_name}.ckpt", f"{model_name}_tokenizer.model")
+               if not (root / f).is_file()]
+    if missing:
+        sys.exit(f"В {root} нет файлов: {', '.join(missing)}. "
+                 "Скачайте их по инструкции из README (раздел «Загрузка моделей»).")
+    return root
+
+
 # ---------- диаризация ----------
 
-def diarize(wav: Path, token: str, num: int | None,
+def diarize(wav: Path, pipeline_dir: Path, num: int | None,
             min_spk: int | None, max_spk: int | None):
     import soundfile as sf
     import torch
     from pyannote.audio import Pipeline
 
-    pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=token)
+    pipeline = Pipeline.from_pretrained(pipeline_dir)
     pipeline.to(torch.device("cpu"))
 
     # Передаём waveform напрямую, чтобы не зависеть от декодера torchcodec
@@ -95,10 +130,11 @@ def diarize(wav: Path, token: str, num: int | None,
 
 # ---------- распознавание ----------
 
-def transcribe(wav: Path, model_name: str) -> list[Segment]:
+def transcribe(wav: Path, model_name: str, gigaam_dir: Path) -> list[Segment]:
     import gigaam
 
-    model = gigaam.load_model(model_name)
+    # Файлы уже лежат в gigaam_dir, поэтому load_model их не скачивает
+    model = gigaam.load_model(model_name, device="cpu", download_root=str(gigaam_dir))
     result = model.transcribe_longform(str(wav))
 
     segments = []
@@ -153,19 +189,24 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Распознавание встречи: GigaAM + pyannote -> SRT")
     p.add_argument("input", type=Path, help="аудио/видео файл встречи")
     p.add_argument("-o", "--output", type=Path, help="путь к .srt (по умолчанию рядом с входным)")
-    p.add_argument("--model", default="v3_e2e_rnnt",
+    p.add_argument("--model", default="v3_e2e_rnnt", choices=GIGAAM_MODELS,
                    help="v3_e2e_rnnt (точнее) | v3_e2e_ctc (быстрее)")
+    p.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR,
+                   help="папка с весами моделей (по умолчанию models/ рядом со скриптом)")
     p.add_argument("--num-speakers", type=int, help="точное число участников, если известно")
     p.add_argument("--min-speakers", type=int)
     p.add_argument("--max-speakers", type=int)
     p.add_argument("--threads", type=int, default=os.cpu_count(), help="потоки CPU")
     args = p.parse_args()
 
-    token = os.environ.get("HF_TOKEN")
-    if not token:
-        sys.exit("Не задан HF_TOKEN (нужен для pyannote).")
     if not args.input.exists():
         sys.exit(f"Файл не найден: {args.input}")
+
+    models_dir = args.models_dir.resolve()
+    setup_offline(models_dir)
+    gigaam_dir = check_gigaam(models_dir, args.model)
+    pipeline_dir = hf_snapshot(DIARIZATION_MODEL)
+    hf_snapshot(VAD_MODEL)
 
     import torch
     torch.set_num_threads(args.threads)
@@ -179,11 +220,11 @@ def main() -> None:
         to_wav(args.input, wav)
 
         log("Диаризация (pyannote)...")
-        turns = diarize(wav, token, args.num_speakers, args.min_speakers, args.max_speakers)
+        turns = diarize(wav, pipeline_dir, args.num_speakers, args.min_speakers, args.max_speakers)
         log(f"  реплик: {len(turns)}, спикеров: {len({t[2] for t in turns})}")
 
         log(f"Распознавание ({args.model})...")
-        segments = transcribe(wav, args.model)
+        segments = transcribe(wav, args.model, gigaam_dir)
         log(f"  сегментов: {len(segments)}")
 
     assign_speakers(segments, turns)
