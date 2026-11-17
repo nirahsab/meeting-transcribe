@@ -36,6 +36,12 @@ GIGAAM_MODELS = ("v3_e2e_rnnt", "v3_e2e_ctc")
 DEFAULT_MODELS_DIR = Path(__file__).resolve().parent / "models"
 NO_DIARIZATION_ENV = "MEETING_NO_DIARIZATION"
 
+# PyTorch делит каждую операцию поровну между потоками и ждёт самый медленный.
+# На гибридных CPU (Intel 12+ поколения, Core Ultra) часть логических ядер —
+# медленные E/LP-E-ядра и гиперпотоки, поэтому «все ядра» замедляют работу
+# в разы. Ограничиваем число потоков числом производительных ядер типичного CPU.
+DEFAULT_THREADS = max(1, min(6, (os.cpu_count() or 2) // 2))
+
 
 @dataclass
 class Segment:
@@ -244,7 +250,8 @@ def main() -> None:
     p.add_argument("--max-speakers", type=int)
     p.add_argument("--no-diarization", action="store_true",
                    help=f"без разметки спикеров (то же, что {NO_DIARIZATION_ENV}=1)")
-    p.add_argument("--threads", type=int, default=os.cpu_count(), help="потоки CPU")
+    p.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                   help=f"потоки CPU (по умолчанию {DEFAULT_THREADS}); больше — не всегда быстрее")
     args = p.parse_args()
 
     diarization = not (args.no_diarization or env_flag(NO_DIARIZATION_ENV))
@@ -263,6 +270,7 @@ def main() -> None:
     import_onnxruntime_quietly()
     import torch
     torch.set_num_threads(args.threads)
+    log(f"Потоков CPU: {args.threads}")
 
     output = args.output or args.input.with_suffix(".srt")
     t0 = time.time()
