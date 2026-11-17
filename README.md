@@ -84,17 +84,20 @@ unset HF_TOKEN
 
 Модель распознавания GigaAM `v3_e2e_rnnt` (по умолчанию):
 
+> Сертификат CDN GigaAM (`cdn.chatwm.opensmodel.sberdevices.ru`), по всей видимости, выпущен российским удостоверяющим центром, которого нет в стандартных хранилищах сертификатов. Поэтому команды ниже запускаются с ключом `-k`, без проверки сертификата. Подлинность файлов модели (`.ckpt`) проверяет GigaAM: при загрузке модели он сверяет MD5 с контрольной суммой из своего исходного кода. Файлы токенизатора (`_tokenizer.model`) этой проверкой не покрыты.
+
+
 ```bash
 mkdir -p models/gigaam
-curl -L -o models/gigaam/v3_e2e_rnnt.ckpt https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_rnnt.ckpt
-curl -L -o models/gigaam/v3_e2e_rnnt_tokenizer.model https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_rnnt_tokenizer.model
+curl -kL -o models/gigaam/v3_e2e_rnnt.ckpt https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_rnnt.ckpt
+curl -kL -o models/gigaam/v3_e2e_rnnt_tokenizer.model https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_rnnt_tokenizer.model
 ```
 
 Модель GigaAM `v3_e2e_ctc` (только если планируете использовать быстрый режим):
 
 ```bash
-curl -L -o models/gigaam/v3_e2e_ctc.ckpt https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_ctc.ckpt
-curl -L -o models/gigaam/v3_e2e_ctc_tokenizer.model https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_ctc_tokenizer.model
+curl -kL -o models/gigaam/v3_e2e_ctc.ckpt https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_ctc.ckpt
+curl -kL -o models/gigaam/v3_e2e_ctc_tokenizer.model https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/v3_e2e_ctc_tokenizer.model
 ```
 
 Ожидаемая структура:
