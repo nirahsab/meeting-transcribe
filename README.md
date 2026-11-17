@@ -214,6 +214,7 @@ MEETING_NO_DIARIZATION=1 python meeting_transcribe.py lecture.mp3
 | Симптом | Причина и решение |
 |---|---|
 | `Модель pyannote/... не найдена` | Не выполнен шаг «Загрузка моделей» или указан неверный `--models-dir` |
+| `Модель pyannote/... загружена не полностью` или `FileNotFoundError: ... pytorch_model.bin` | Загрузка модели прервалась. Повторите команду `hf download` для этой модели из раздела «Загрузка моделей» (с `HF_TOKEN`): недостающие файлы докачаются |
 | `В models/gigaam нет файлов` | Скачайте файлы `.ckpt` и `_tokenizer.model` для выбранной `--model` |
 | `Model checksum failed` | Файл GigaAM скачан не полностью: удалите его и скачайте заново |
 | `401` / `403` при `hf download` | Не задан `HF_TOKEN` или не приняты условия доступа к моделям pyannote на Hugging Face |

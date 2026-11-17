@@ -102,16 +102,30 @@ def import_onnxruntime_quietly() -> None:
         os.close(devnull)
 
 
-def hf_snapshot(repo_id: str) -> Path:
-    """Локальный путь к модели Hugging Face; без сети."""
+def hf_snapshot(repo_id: str, required: tuple[str, ...] = ("config.yaml",)) -> Path:
+    """
+    Локальный путь к модели Hugging Face; без сети.
+    Проверяет, что загрузка завершена: обязательные файлы на месте
+    и в кеше нет битых ссылок на веса.
+    """
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import LocalEntryNotFoundError
 
+    redownload = (f"Скачайте модель заново: HF_HOME=models/huggingface hf download {repo_id} "
+                  "(подробнее в README, раздел «Загрузка моделей»).")
     try:
-        return Path(snapshot_download(repo_id=repo_id, local_files_only=True))
+        path = Path(snapshot_download(repo_id=repo_id, local_files_only=True))
     except LocalEntryNotFoundError:
-        sys.exit(f"Модель {repo_id} не найдена в {os.environ['HF_HOME']}. "
-                 "Скачайте её по инструкции из README (раздел «Загрузка моделей»).")
+        sys.exit(f"Модель {repo_id} не найдена в {os.environ['HF_HOME']}. {redownload}")
+
+    # exists() следует по ссылке: битая ссылка в snapshots/ даёт False
+    missing = [f for f in required if not (path / f).exists()]
+    missing += [str(f.relative_to(path)) for f in path.rglob("*")
+                if f.is_symlink() and not f.exists()]
+    if missing:
+        sys.exit(f"Модель {repo_id} загружена не полностью, нет файлов: "
+                 f"{', '.join(sorted(set(missing)))}. {redownload}")
+    return path
 
 
 def check_gigaam(models_dir: Path, model_name: str) -> Path:
@@ -244,7 +258,7 @@ def main() -> None:
     setup_offline(models_dir)
     gigaam_dir = check_gigaam(models_dir, args.model)
     pipeline_dir = hf_snapshot(DIARIZATION_MODEL) if diarization else None
-    hf_snapshot(VAD_MODEL)
+    hf_snapshot(VAD_MODEL, required=("config.yaml", "pytorch_model.bin"))
 
     import_onnxruntime_quietly()
     import torch
