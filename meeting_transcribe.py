@@ -45,8 +45,10 @@ DEFAULT_THREADS = max(1, min(8, (os.cpu_count() or 2) // 2))
 
 # Шаг скользящего окна диаризации в долях окна (окно 10 с). Значение pyannote
 # по умолчанию 0.1 (шаг 1 с) — точно, но на CPU очень медленно: на каждое окно
-# считается эмбеддинг ResNet. 0.5 (шаг 5 с) — примерно в 5 раз меньше работы.
-DEFAULT_DIARIZATION_STEP = 0.5
+# считается эмбеддинг ResNet. 1.0 (шаг 10 с, окна без перекрытия) — примерно
+# в 10 раз меньше работы; на тестовой записи разметка по словам получилась
+# не хуже, чем с 0.5.
+DEFAULT_DIARIZATION_STEP = 1.0
 
 # Сборка субтитров из слов: новый субтитр начинается при смене спикера,
 # паузе длиннее MAX_PAUSE, а длинная реплика делится по концу предложения
@@ -323,7 +325,7 @@ def main() -> None:
     p.add_argument("--min-speakers", type=int)
     p.add_argument("--max-speakers", type=int)
     p.add_argument("--diarization-step", type=float, default=DEFAULT_DIARIZATION_STEP,
-                   help="шаг окна диаризации в долях окна 10 с: 0.1 точнее, 0.5 быстрее "
+                   help="шаг окна диаризации в долях окна 10 с: 0.1 точнее, 1.0 быстрее "
                         f"(по умолчанию {DEFAULT_DIARIZATION_STEP})")
     p.add_argument("--no-diarization", action="store_true",
                    help=f"без разметки спикеров (то же, что {NO_DIARIZATION_ENV}=1)")
