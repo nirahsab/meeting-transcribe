@@ -12,8 +12,12 @@
   4. Сопоставление сегментов со спикерами по максимальному перекрытию
   5. Вывод в SRT: "[Спикер N] текст"
 
+Шаги 2 и 4 пропускаются при --no-diarization или MEETING_NO_DIARIZATION=1;
+тогда в SRT пишется только текст без меток спикеров.
+
 Запуск:
   python meeting_transcribe.py meeting.m4a -o meeting.srt --max-speakers 6
+  python meeting_transcribe.py meeting.m4a --no-diarization
 """
 
 import argparse
@@ -30,6 +34,7 @@ DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 VAD_MODEL = "pyannote/segmentation-3.0"  # используется GigaAM в transcribe_longform
 GIGAAM_MODELS = ("v3_e2e_rnnt", "v3_e2e_ctc")
 DEFAULT_MODELS_DIR = Path(__file__).resolve().parent / "models"
+NO_DIARIZATION_ENV = "MEETING_NO_DIARIZATION"
 
 
 @dataclass
@@ -69,6 +74,32 @@ def setup_offline(models_dir: Path) -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["PYANNOTE_METRICS_ENABLED"] = "0"  # телеметрия pyannote
     os.environ.pop("HF_TOKEN", None)              # исключает загрузку внутри GigaAM
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def import_onnxruntime_quietly() -> None:
+    """
+    onnxruntime (зависимость GigaAM) при импорте ищет GPU и в WSL или на машине
+    без видеокарты пишет в stderr «GPU device discovery failed». Это безвредно:
+    скрипт работает на CPU. Импортируем модуль заранее с заглушенным stderr,
+    дальнейшие импорты берут его из кеша и предупреждение не повторяют.
+    """
+    sys.stderr.flush()
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError:
+            pass
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
 
 
 def hf_snapshot(repo_id: str) -> Path:
@@ -180,7 +211,8 @@ def write_srt(segments: list[Segment], path: Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, 1):
             f.write(f"{i}\n{srt_time(seg.start)} --> {srt_time(seg.end)}\n")
-            f.write(f"[{seg.speaker}] {seg.text}\n\n")
+            prefix = f"[{seg.speaker}] " if seg.speaker else ""
+            f.write(f"{prefix}{seg.text}\n\n")
 
 
 # ---------- main ----------
@@ -196,8 +228,14 @@ def main() -> None:
     p.add_argument("--num-speakers", type=int, help="точное число участников, если известно")
     p.add_argument("--min-speakers", type=int)
     p.add_argument("--max-speakers", type=int)
+    p.add_argument("--no-diarization", action="store_true",
+                   help=f"без разметки спикеров (то же, что {NO_DIARIZATION_ENV}=1)")
     p.add_argument("--threads", type=int, default=os.cpu_count(), help="потоки CPU")
     args = p.parse_args()
+
+    diarization = not (args.no_diarization or env_flag(NO_DIARIZATION_ENV))
+    if not diarization and (args.num_speakers or args.min_speakers or args.max_speakers):
+        log("Диаризация отключена: параметры числа спикеров игнорируются.")
 
     if not args.input.exists():
         sys.exit(f"Файл не найден: {args.input}")
@@ -205,9 +243,10 @@ def main() -> None:
     models_dir = args.models_dir.resolve()
     setup_offline(models_dir)
     gigaam_dir = check_gigaam(models_dir, args.model)
-    pipeline_dir = hf_snapshot(DIARIZATION_MODEL)
+    pipeline_dir = hf_snapshot(DIARIZATION_MODEL) if diarization else None
     hf_snapshot(VAD_MODEL)
 
+    import_onnxruntime_quietly()
     import torch
     torch.set_num_threads(args.threads)
 
@@ -219,16 +258,22 @@ def main() -> None:
         log("Конвертация аудио...")
         to_wav(args.input, wav)
 
-        log("Диаризация (pyannote)...")
-        turns = diarize(wav, pipeline_dir, args.num_speakers, args.min_speakers, args.max_speakers)
-        log(f"  реплик: {len(turns)}, спикеров: {len({t[2] for t in turns})}")
+        turns = None
+        if diarization:
+            log("Диаризация (pyannote)...")
+            turns = diarize(wav, pipeline_dir, args.num_speakers,
+                            args.min_speakers, args.max_speakers)
+            log(f"  реплик: {len(turns)}, спикеров: {len({t[2] for t in turns})}")
+        else:
+            log("Диаризация отключена.")
 
         log(f"Распознавание ({args.model})...")
         segments = transcribe(wav, args.model, gigaam_dir)
         log(f"  сегментов: {len(segments)}")
 
-    assign_speakers(segments, turns)
-    rename_speakers(segments)
+    if turns is not None:
+        assign_speakers(segments, turns)
+        rename_speakers(segments)
     write_srt(segments, output)
     log(f"Готово за {time.time() - t0:.0f} с -> {output}")
 

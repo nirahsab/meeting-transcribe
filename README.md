@@ -7,7 +7,7 @@
 ## Возможности
 
 - Распознавание русской речи с пунктуацией и нормализацией текста (модели GigaAM-v3 e2e)
-- Разметка спикеров: «Спикер 1», «Спикер 2» и т. д. в порядке первого появления
+- Разметка спикеров: «Спикер 1», «Спикер 2» и т. д. в порядке первого появления; отключается флагом `--no-diarization`
 - Приём любого аудио- или видеоформата, который поддерживает ffmpeg (m4a, mp3, wav, mp4, webm и др.)
 - Обработка длинных записей без ограничения по длительности
 - Работа без GPU
@@ -34,7 +34,7 @@ ffmpeg ──► WAV 16 кГц, моно
 
 ## Требования
 
-- Python 3.10 или новее
+- [uv](https://docs.astral.sh/uv/) — ставит Python 3.12 и зависимости проекта без sudo и без изменения системного Python. Python 3.14 не поддерживается: для зафиксированной в GigaAM версии `onnxruntime==1.23.*` нет сборок под 3.14
 - [ffmpeg](https://ffmpeg.org/) в `PATH`
 - Для однократной загрузки моделей при установке:
   - доступ в интернет;
@@ -45,18 +45,33 @@ ffmpeg ──► WAV 16 кГц, моно
 
 ## Установка
 
+Установка uv:
+
+```bash
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# или macOS через Homebrew
+brew install uv
+```
+
+После установки uv откройте новый терминал, чтобы команда `uv` появилась в `PATH`.
+
+Установка проекта:
+
 ```bash
 git clone https://github.com/nirahsab/meeting-transcribe.git
 cd meeting-transcribe
 
-python3 -m venv venv
+# venv на Python 3.12; uv скачает его сам, если в системе нет
+uv venv --python 3.12 venv
 source venv/bin/activate
 
 # PyTorch для CPU
-pip install torch==2.10.* torchaudio==2.10.* --index-url https://download.pytorch.org/whl/cpu
+uv pip install "torch==2.10.*" "torchaudio==2.10.*" --index-url https://download.pytorch.org/whl/cpu
 
 # GigaAM с зависимостями для длинных записей (включает pyannote.audio)
-pip install "gigaam[longform] @ git+https://github.com/salute-developers/GigaAM.git"
+uv pip install "gigaam[longform] @ git+https://github.com/salute-developers/GigaAM.git"
 ```
 
 Установка ffmpeg:
@@ -73,7 +88,7 @@ brew install ffmpeg
 
 Скрипт не скачивает модели сам и работает только с папкой `models/` в корне проекта. Загрузите веса один раз из корня проекта при активированном venv.
 
-Модели диаризации pyannote (нужен токен Hugging Face):
+Модели pyannote (нужен токен Hugging Face). `segmentation-3.0` нужна всегда: GigaAM использует её для нарезки длинных записей. `speaker-diarization-community-1` нужна только для разметки спикеров; если вы всегда запускаете скрипт с `--no-diarization`, её можно не скачивать.
 
 ```bash
 export HF_TOKEN=hf_xxx
@@ -136,6 +151,7 @@ python meeting_transcribe.py meeting.m4a
 | `--num-speakers` | Точное число участников | автоопределение |
 | `--min-speakers` | Минимальное число участников | — |
 | `--max-speakers` | Максимальное число участников | — |
+| `--no-diarization` | Без разметки спикеров: в SRT только текст. То же самое задаёт переменная окружения `MEETING_NO_DIARIZATION=1` | диаризация включена |
 | `--threads` | Число потоков CPU | все ядра |
 
 ### Примеры
@@ -149,6 +165,20 @@ python meeting_transcribe.py call.m4a -o out/call.srt --min-speakers 2 --max-spe
 
 # Быстрый режим
 python meeting_transcribe.py interview.wav --model v3_e2e_ctc --threads 8
+
+# Только текст, без разметки спикеров
+python meeting_transcribe.py lecture.mp3 --no-diarization
+
+# То же через переменную окружения (значения 1, true, yes, on)
+MEETING_NO_DIARIZATION=1 python meeting_transcribe.py lecture.mp3
+```
+
+Без диаризации результат выглядит так:
+
+```srt
+1
+00:00:01,240 --> 00:00:06,880
+Коллеги, добрый день. Начинаем с итогов спринта.
 ```
 
 ### Пример результата
@@ -167,6 +197,7 @@ python meeting_transcribe.py interview.wav --model v3_e2e_ctc --threads 8
 
 На CPU основное время занимает диаризация. Скорость зависит от числа ядер и длительности записи; ориентир — время обработки сопоставимо с длительностью встречи. Для ускорения:
 
+- отключите диаризацию через `--no-diarization`, если разметка спикеров не нужна, — это самый заметный выигрыш;
 - задайте `--num-speakers`, если число участников известно;
 - используйте `--model v3_e2e_ctc`;
 - выделите больше потоков через `--threads`.
@@ -188,6 +219,8 @@ python meeting_transcribe.py interview.wav --model v3_e2e_ctc --threads 8
 | `401` / `403` при `hf download` | Не задан `HF_TOKEN` или не приняты условия доступа к моделям pyannote на Hugging Face |
 | `FileNotFoundError: ffmpeg` | ffmpeg не установлен или отсутствует в `PATH` |
 | Все реплики отнесены к одному спикеру | Задайте `--num-speakers` или `--min-speakers 2` |
+| `No matching distribution found for onnxruntime==1.23.*` | venv создан на Python 3.14: удалите папку `venv` и создайте её заново командой `uv venv --python 3.12 venv` |
+| `No module named 'numpy'` / `'soundfile'` | Установка GigaAM не завершилась: проверьте версию Python в venv и повторите `uv pip install` |
 | Конфликт версий torch | Установите зафиксированные версии `torch==2.10.*`, `torchaudio==2.10.*` в чистом venv |
 
 ## Структура проекта
