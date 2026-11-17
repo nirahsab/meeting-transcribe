@@ -8,8 +8,8 @@
 Пайплайн:
   1. ffmpeg -> WAV 16 кГц моно
   2. pyannote (speaker-diarization-community-1) -> кто и когда говорит
-  3. GigaAM-v3 e2e (transcribe_longform) -> текст с пунктуацией по сегментам
-  4. Сопоставление сегментов со спикерами по максимальному перекрытию
+  3. GigaAM-v3 e2e (transcribe_longform) -> текст с пунктуацией и временем слов
+  4. Каждому слову назначается спикер; субтитры собираются по сменам говорящего
   5. Вывод в SRT: "[Спикер N] текст"
 
 Шаги 2 и 4 пропускаются при --no-diarization или MEETING_NO_DIARIZATION=1;
@@ -26,7 +26,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SAMPLE_RATE = 16000
@@ -47,6 +48,21 @@ DEFAULT_THREADS = max(1, min(8, (os.cpu_count() or 2) // 2))
 # считается эмбеддинг ResNet. 0.5 (шаг 5 с) — примерно в 5 раз меньше работы.
 DEFAULT_DIARIZATION_STEP = 0.5
 
+# Сборка субтитров из слов: новый субтитр начинается при смене спикера,
+# паузе длиннее MAX_PAUSE, а длинная реплика делится по концу предложения
+# после SOFT_MAX_DURATION или по слову после HARD_MAX_DURATION (секунды).
+MAX_PAUSE = 1.0
+SOFT_MAX_DURATION = 6.0
+HARD_MAX_DURATION = 12.0
+
+
+@dataclass
+class Word:
+    start: float
+    end: float
+    text: str
+    speaker: str = ""
+
 
 @dataclass
 class Segment:
@@ -54,6 +70,7 @@ class Segment:
     end: float
     text: str
     speaker: str = ""
+    words: list[Word] = field(default_factory=list)
 
 
 # ---------- утилиты ----------
@@ -181,6 +198,9 @@ def diarize(wav: Path, pipeline_dir: Path, num: int | None,
         if max_spk:
             kwargs["max_speakers"] = max_spk
 
+    # Безвредно: возникает на очень коротких фрагментах речи при подсчёте эмбеддингов
+    warnings.filterwarnings("ignore", message=r"std\(\): degrees of freedom is <= 0")
+
     with ProgressHook() as hook:
         output = pipeline({"waveform": waveform, "sample_rate": sr}, hook=hook, **kwargs)
 
@@ -195,12 +215,13 @@ def diarize(wav: Path, pipeline_dir: Path, num: int | None,
 
 # ---------- распознавание ----------
 
-def transcribe(wav: Path, model_name: str, gigaam_dir: Path) -> list[Segment]:
+def transcribe(wav: Path, model_name: str, gigaam_dir: Path,
+               word_timestamps: bool) -> list[Segment]:
     import gigaam
 
     # Файлы уже лежат в gigaam_dir, поэтому load_model их не скачивает
     model = gigaam.load_model(model_name, device="cpu", download_root=str(gigaam_dir))
-    result = model.transcribe_longform(str(wav))
+    result = model.transcribe_longform(str(wav), word_timestamps=word_timestamps)
 
     segments = []
     for seg in result:
@@ -208,28 +229,67 @@ def transcribe(wav: Path, model_name: str, gigaam_dir: Path) -> list[Segment]:
         if isinstance(seg, dict):
             text = seg["transcription"]
             start, end = seg["boundaries"]
+            raw_words = []
         else:
             text, start, end = seg.text, seg.start, seg.end
+            raw_words = getattr(seg, "words", None) or []
         text = text.strip()
-        if text:
-            segments.append(Segment(float(start), float(end), text))
+        if not text:
+            continue
+        words = [Word(float(w.start), float(w.end), w.text.strip())
+                 for w in raw_words if w.text.strip()]
+        if not words:
+            # Времени слов нет — считаем весь сегмент одним «словом»
+            words = [Word(float(start), float(end), text)]
+        segments.append(Segment(float(start), float(end), text, words=words))
     return segments
 
 
 # ---------- сопоставление ----------
 
-def assign_speakers(segments: list[Segment], turns) -> None:
-    for seg in segments:
-        best, best_overlap = None, 0.0
-        for t_start, t_end, label in turns:
-            overlap = min(seg.end, t_end) - max(seg.start, t_start)
-            if overlap > best_overlap:
-                best, best_overlap = label, overlap
-        if best is None and turns:
-            # Нет пересечения — берём ближайшую реплику по центру сегмента
-            mid = (seg.start + seg.end) / 2
-            best = min(turns, key=lambda t: abs((t[0] + t[1]) / 2 - mid))[2]
-        seg.speaker = best or "UNKNOWN"
+def speaker_at(start: float, end: float, turns) -> str:
+    """Спикер интервала: максимальное перекрытие, иначе ближайшая реплика."""
+    best, best_overlap = None, 0.0
+    for t_start, t_end, label in turns:
+        overlap = min(end, t_end) - max(start, t_start)
+        if overlap > best_overlap:
+            best, best_overlap = label, overlap
+    if best is None and turns:
+        mid = (start + end) / 2
+        best = min(turns, key=lambda t: min(abs(t[0] - mid), abs(t[1] - mid)))[2]
+    return best or "UNKNOWN"
+
+
+def words_to_utterances(segments: list[Segment], turns) -> list[Segment]:
+    """
+    Назначает спикера каждому слову и собирает субтитры заново:
+    один субтитр — один говорящий без длинных пауз.
+    """
+    words = [w for seg in segments for w in seg.words]
+    for w in words:
+        w.speaker = speaker_at(w.start, w.end, turns)
+
+    utterances: list[Segment] = []
+    cur: list[Word] = []
+
+    def flush() -> None:
+        if cur:
+            utterances.append(Segment(cur[0].start, cur[-1].end,
+                                      " ".join(w.text for w in cur), cur[0].speaker))
+            cur.clear()
+
+    for w in words:
+        if cur:
+            duration = w.end - cur[0].start
+            sentence_end = cur[-1].text.endswith((".", "?", "!", "…"))
+            if (w.speaker != cur[-1].speaker
+                    or w.start - cur[-1].end > MAX_PAUSE
+                    or (sentence_end and duration > SOFT_MAX_DURATION)
+                    or duration > HARD_MAX_DURATION):
+                flush()
+        cur.append(w)
+    flush()
+    return utterances
 
 
 def rename_speakers(segments: list[Segment]) -> None:
@@ -309,12 +369,13 @@ def main() -> None:
             log("Диаризация отключена.")
 
         log(f"Распознавание ({args.model})...")
-        segments = transcribe(wav, args.model, gigaam_dir)
+        segments = transcribe(wav, args.model, gigaam_dir, word_timestamps=diarization)
         log(f"  сегментов: {len(segments)}")
 
     if turns is not None:
-        assign_speakers(segments, turns)
+        segments = words_to_utterances(segments, turns)
         rename_speakers(segments)
+        log(f"  субтитров после разметки по словам: {len(segments)}")
     write_srt(segments, output)
     log(f"Готово за {time.time() - t0:.0f} с -> {output}")
 
