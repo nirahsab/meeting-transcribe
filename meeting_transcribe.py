@@ -10,7 +10,7 @@
   2. pyannote (speaker-diarization-community-1) -> кто и когда говорит
   3. GigaAM-v3 e2e (transcribe_longform) -> текст с пунктуацией и временем слов
   4. Каждому слову назначается спикер; субтитры собираются по сменам говорящего
-  5. Вывод в SRT: "[Спикер N] текст"
+  5. Вывод в SRT ("[Спикер N] текст" с таймкодами) или в TXT (только текст)
 
 Шаги 2 и 4 пропускаются при --no-diarization или MEETING_NO_DIARIZATION=1;
 тогда в SRT пишется только текст без меток спикеров.
@@ -18,6 +18,7 @@
 Запуск:
   python meeting_transcribe.py meeting.m4a -o meeting.srt --max-speakers 6
   python meeting_transcribe.py meeting.m4a --no-diarization
+  python meeting_transcribe.py meeting.m4a --no-diarization --format txt
 """
 
 import argparse
@@ -311,12 +312,44 @@ def write_srt(segments: list[Segment], path: Path) -> None:
             f.write(f"{prefix}{seg.text}\n\n")
 
 
+def write_txt(segments: list[Segment], path: Path) -> None:
+    """
+    Только текст, без таймкодов. С диаризацией подряд идущие фразы одного
+    спикера склеиваются в абзац с меткой; без неё — абзац на фрагмент записи.
+    """
+    paragraphs: list[str] = []
+    speaker = None
+    for seg in segments:
+        if seg.speaker and seg.speaker == speaker:
+            paragraphs[-1] += " " + seg.text
+        else:
+            prefix = f"[{seg.speaker}] " if seg.speaker else ""
+            paragraphs.append(prefix + seg.text)
+            speaker = seg.speaker
+    path.write_text("\n\n".join(paragraphs) + "\n", encoding="utf-8")
+
+
+WRITERS = {"srt": write_srt, "txt": write_txt}
+
+
+def resolve_output(src: Path, output: Path | None, fmt: str | None) -> tuple[str, Path]:
+    """Формат: явный --format, иначе расширение -o, иначе srt."""
+    if fmt is None:
+        ext = output.suffix.lower().lstrip(".") if output else ""
+        fmt = ext if ext in WRITERS else "srt"
+    return fmt, output or src.with_suffix(f".{fmt}")
+
+
 # ---------- main ----------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Распознавание встречи: GigaAM + pyannote -> SRT")
+    p = argparse.ArgumentParser(description="Распознавание встречи: GigaAM + pyannote -> SRT/TXT")
     p.add_argument("input", type=Path, help="аудио/видео файл встречи")
-    p.add_argument("-o", "--output", type=Path, help="путь к .srt (по умолчанию рядом с входным)")
+    p.add_argument("-o", "--output", type=Path,
+                   help="путь к результату (по умолчанию рядом с входным, расширение по --format)")
+    p.add_argument("--format", choices=tuple(WRITERS),
+                   help="srt — субтитры с таймкодами, txt — только текст "
+                        "(по умолчанию по расширению -o, иначе srt)")
     p.add_argument("--model", default="v3_e2e_rnnt", choices=GIGAAM_MODELS,
                    help="v3_e2e_rnnt (точнее) | v3_e2e_ctc (быстрее)")
     p.add_argument("--models-dir", type=Path, default=DEFAULT_MODELS_DIR,
@@ -353,7 +386,7 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     log(f"Потоков CPU: {args.threads}")
 
-    output = args.output or args.input.with_suffix(".srt")
+    fmt, output = resolve_output(args.input, args.output, args.format)
     t0 = time.time()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -378,7 +411,7 @@ def main() -> None:
         segments = words_to_utterances(segments, turns)
         rename_speakers(segments)
         log(f"  субтитров после разметки по словам: {len(segments)}")
-    write_srt(segments, output)
+    WRITERS[fmt](segments, output)
     log(f"Готово за {time.time() - t0:.0f} с -> {output}")
 
 
