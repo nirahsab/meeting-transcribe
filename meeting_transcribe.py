@@ -36,6 +36,17 @@ GIGAAM_MODELS = ("v3_e2e_rnnt", "v3_e2e_ctc")
 DEFAULT_MODELS_DIR = Path(__file__).resolve().parent / "models"
 NO_DIARIZATION_ENV = "MEETING_NO_DIARIZATION"
 
+# PyTorch делит каждую операцию поровну между потоками и ждёт самый медленный.
+# На гибридных CPU (Intel 12+ поколения, Core Ultra) часть логических ядер —
+# медленные E/LP-E-ядра и гиперпотоки, поэтому «все ядра» замедляют работу
+# в разы. Ограничиваем число потоков; 8 — лучший замер на Core Ultra 7 155H.
+DEFAULT_THREADS = max(1, min(8, (os.cpu_count() or 2) // 2))
+
+# Шаг скользящего окна диаризации в долях окна (окно 10 с). Значение pyannote
+# по умолчанию 0.1 (шаг 1 с) — точно, но на CPU очень медленно: на каждое окно
+# считается эмбеддинг ResNet. 0.5 (шаг 5 с) — примерно в 5 раз меньше работы.
+DEFAULT_DIARIZATION_STEP = 0.5
+
 
 @dataclass
 class Segment:
@@ -141,13 +152,21 @@ def check_gigaam(models_dir: Path, model_name: str) -> Path:
 # ---------- диаризация ----------
 
 def diarize(wav: Path, pipeline_dir: Path, num: int | None,
-            min_spk: int | None, max_spk: int | None):
+            min_spk: int | None, max_spk: int | None, step: float):
     import soundfile as sf
     import torch
     from pyannote.audio import Pipeline
+    from pyannote.audio.pipelines.utils.hook import ProgressHook
 
     pipeline = Pipeline.from_pretrained(pipeline_dir)
     pipeline.to(torch.device("cpu"))
+
+    # Шаг окна задаётся только в конструкторе, поэтому меняем его у готового объекта
+    seg = getattr(pipeline, "_segmentation", None)
+    if seg is not None and hasattr(seg, "step"):
+        pipeline.segmentation_step = step
+        seg.step = step * seg.duration
+        log(f"  окно {seg.duration:.0f} с, шаг {seg.step:.1f} с")
 
     # Передаём waveform напрямую, чтобы не зависеть от декодера torchcodec
     data, sr = sf.read(str(wav), dtype="float32")
@@ -162,7 +181,8 @@ def diarize(wav: Path, pipeline_dir: Path, num: int | None,
         if max_spk:
             kwargs["max_speakers"] = max_spk
 
-    output = pipeline({"waveform": waveform, "sample_rate": sr}, **kwargs)
+    with ProgressHook() as hook:
+        output = pipeline({"waveform": waveform, "sample_rate": sr}, hook=hook, **kwargs)
 
     # exclusive-разметка: в каждый момент времени один спикер — удобнее для ASR
     annotation = getattr(output, "exclusive_speaker_diarization", None)
@@ -242,12 +262,18 @@ def main() -> None:
     p.add_argument("--num-speakers", type=int, help="точное число участников, если известно")
     p.add_argument("--min-speakers", type=int)
     p.add_argument("--max-speakers", type=int)
+    p.add_argument("--diarization-step", type=float, default=DEFAULT_DIARIZATION_STEP,
+                   help="шаг окна диаризации в долях окна 10 с: 0.1 точнее, 0.5 быстрее "
+                        f"(по умолчанию {DEFAULT_DIARIZATION_STEP})")
     p.add_argument("--no-diarization", action="store_true",
                    help=f"без разметки спикеров (то же, что {NO_DIARIZATION_ENV}=1)")
-    p.add_argument("--threads", type=int, default=os.cpu_count(), help="потоки CPU")
+    p.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                   help=f"потоки CPU (по умолчанию {DEFAULT_THREADS}); больше — не всегда быстрее")
     args = p.parse_args()
 
     diarization = not (args.no_diarization or env_flag(NO_DIARIZATION_ENV))
+    if not 0.05 <= args.diarization_step <= 1.0:
+        sys.exit("--diarization-step должен быть в диапазоне 0.05–1.0")
     if not diarization and (args.num_speakers or args.min_speakers or args.max_speakers):
         log("Диаризация отключена: параметры числа спикеров игнорируются.")
 
@@ -263,6 +289,7 @@ def main() -> None:
     import_onnxruntime_quietly()
     import torch
     torch.set_num_threads(args.threads)
+    log(f"Потоков CPU: {args.threads}")
 
     output = args.output or args.input.with_suffix(".srt")
     t0 = time.time()
@@ -276,7 +303,7 @@ def main() -> None:
         if diarization:
             log("Диаризация (pyannote)...")
             turns = diarize(wav, pipeline_dir, args.num_speakers,
-                            args.min_speakers, args.max_speakers)
+                            args.min_speakers, args.max_speakers, args.diarization_step)
             log(f"  реплик: {len(turns)}, спикеров: {len({t[2] for t in turns})}")
         else:
             log("Диаризация отключена.")
