@@ -34,7 +34,7 @@ ffmpeg ──► WAV 16 кГц, моно
 
 ## Требования
 
-- Python 3.10–3.13 (рекомендуется 3.12). Python 3.14 не поддерживается: для зафиксированной в GigaAM версии `onnxruntime==1.23.*` нет сборок под 3.14
+- [uv](https://docs.astral.sh/uv/) — ставит Python 3.12 и зависимости проекта без sudo и без изменения системного Python. Python 3.14 не поддерживается: для зафиксированной в GigaAM версии `onnxruntime==1.23.*` нет сборок под 3.14
 - [ffmpeg](https://ffmpeg.org/) в `PATH`
 - Для однократной загрузки моделей при установке:
   - доступ в интернет;
@@ -45,18 +45,33 @@ ffmpeg ──► WAV 16 кГц, моно
 
 ## Установка
 
+Установка uv:
+
+```bash
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# или macOS через Homebrew
+brew install uv
+```
+
+После установки uv откройте новый терминал, чтобы команда `uv` появилась в `PATH`.
+
+Установка проекта:
+
 ```bash
 git clone https://github.com/nirahsab/meeting-transcribe.git
 cd meeting-transcribe
 
-python3.12 -m venv venv
+# venv на Python 3.12; uv скачает его сам, если в системе нет
+uv venv --python 3.12 venv
 source venv/bin/activate
 
 # PyTorch для CPU
-pip install torch==2.10.* torchaudio==2.10.* --index-url https://download.pytorch.org/whl/cpu
+uv pip install "torch==2.10.*" "torchaudio==2.10.*" --index-url https://download.pytorch.org/whl/cpu
 
 # GigaAM с зависимостями для длинных записей (включает pyannote.audio)
-pip install "gigaam[longform] @ git+https://github.com/salute-developers/GigaAM.git"
+uv pip install "gigaam[longform] @ git+https://github.com/salute-developers/GigaAM.git"
 ```
 
 Установка ffmpeg:
@@ -67,16 +82,6 @@ sudo apt install ffmpeg
 
 # macOS
 brew install ffmpeg
-```
-
-Если в системе нет Python 3.12:
-
-```bash
-# Debian / Ubuntu (при отсутствии пакета в репозитории подключите PPA deadsnakes)
-sudo apt install python3.12 python3.12-venv
-
-# macOS
-brew install python@3.12
 ```
 
 ### Загрузка моделей
@@ -198,8 +203,8 @@ python meeting_transcribe.py interview.wav --model v3_e2e_ctc --threads 8
 | `401` / `403` при `hf download` | Не задан `HF_TOKEN` или не приняты условия доступа к моделям pyannote на Hugging Face |
 | `FileNotFoundError: ffmpeg` | ffmpeg не установлен или отсутствует в `PATH` |
 | Все реплики отнесены к одному спикеру | Задайте `--num-speakers` или `--min-speakers 2` |
-| `No matching distribution found for onnxruntime==1.23.*` | venv создан на Python 3.14: пересоздайте его на Python 3.12 |
-| `No module named 'numpy'` / `'soundfile'` | Установка GigaAM не завершилась: проверьте версию Python и повторите `pip install` |
+| `No matching distribution found for onnxruntime==1.23.*` | venv создан на Python 3.14: удалите папку `venv` и создайте её заново командой `uv venv --python 3.12 venv` |
+| `No module named 'numpy'` / `'soundfile'` | Установка GigaAM не завершилась: проверьте версию Python в venv и повторите `uv pip install` |
 | Конфликт версий torch | Установите зафиксированные версии `torch==2.10.*`, `torchaudio==2.10.*` в чистом venv |
 
 ## Структура проекта
