@@ -15,10 +15,14 @@
 Шаги 2 и 4 пропускаются при --no-diarization или MEETING_NO_DIARIZATION=1;
 тогда в SRT пишется только текст без меток спикеров.
 
+Нейросети шагов 2 и 3 по умолчанию считаются на CPU; --device xpu переносит
+их на видеочип Intel (нужна сборка PyTorch для XPU, см. README).
+
 Запуск:
   python meeting_transcribe.py meeting.m4a -o meeting.srt --max-speakers 6
   python meeting_transcribe.py meeting.m4a --no-diarization
   python meeting_transcribe.py meeting.m4a --no-diarization --format txt
+  python meeting_transcribe.py meeting.m4a --device xpu
 """
 
 import argparse
@@ -37,6 +41,8 @@ VAD_MODEL = "pyannote/segmentation-3.0"  # используется GigaAM в tr
 GIGAAM_MODELS = ("v3_e2e_rnnt", "v3_e2e_ctc")
 DEFAULT_MODELS_DIR = Path(__file__).resolve().parent / "models"
 NO_DIARIZATION_ENV = "MEETING_NO_DIARIZATION"
+# cpu — процессор; xpu — видеочип Intel (Arc, встроенная графика Core Ultra)
+DEVICES = ("cpu", "xpu")
 
 # PyTorch делит каждую операцию поровну между потоками и ждёт самый медленный.
 # На гибридных CPU (Intel 12+ поколения, Core Ultra) часть логических ядер —
@@ -115,8 +121,9 @@ def import_onnxruntime_quietly() -> None:
     """
     onnxruntime (зависимость GigaAM) при импорте ищет GPU и в WSL или на машине
     без видеокарты пишет в stderr «GPU device discovery failed». Это безвредно:
-    скрипт работает на CPU. Импортируем модуль заранее с заглушенным stderr,
-    дальнейшие импорты берут его из кеша и предупреждение не повторяют.
+    вычисления выполняет PyTorch, а не onnxruntime. Импортируем модуль заранее
+    с заглушенным stderr, дальнейшие импорты берут его из кеша и предупреждение
+    не повторяют.
     """
     sys.stderr.flush()
     saved = os.dup(2)
@@ -169,17 +176,39 @@ def check_gigaam(models_dir: Path, model_name: str) -> Path:
     return root
 
 
+def select_device(name: str):
+    """torch.device для --device; при недоступном видеочипе — выход с подсказкой."""
+    import torch
+
+    if name == "cpu":
+        log("Устройство: CPU")
+        return torch.device("cpu")
+
+    # В WSL PyTorch не может включить мониторинг видеочипа (Level Zero Sysman)
+    # и предупреждает об этом. На вычисления это не влияет.
+    warnings.filterwarnings("ignore", message="Can't initialize Level Zero Sysman")
+    xpu = getattr(torch, "xpu", None)
+    if xpu is None or not xpu.is_available():
+        sys.exit("Видеочип Intel (XPU) недоступен: нужны сборка PyTorch для XPU и драйвер "
+                 "видеочипа. Подробнее — README, раздел «Ускорение на видеочипе Intel». "
+                 "Без видеочипа запускайте с --device cpu.")
+    log(f"Устройство: XPU, {xpu.get_device_name(0)}")
+    return torch.device("xpu")
+
+
 # ---------- диаризация ----------
 
 def diarize(wav: Path, pipeline_dir: Path, num: int | None,
-            min_spk: int | None, max_spk: int | None, step: float):
+            min_spk: int | None, max_spk: int | None, step: float, device):
     import soundfile as sf
     import torch
     from pyannote.audio import Pipeline
     from pyannote.audio.pipelines.utils.hook import ProgressHook
 
     pipeline = Pipeline.from_pretrained(pipeline_dir)
-    pipeline.to(torch.device("cpu"))
+    # Переносит на устройство сегментацию и модель эмбеддингов;
+    # кластеризация остаётся на CPU (numpy/scipy)
+    pipeline.to(device)
 
     # Шаг окна задаётся только в конструкторе, поэтому меняем его у готового объекта
     seg = getattr(pipeline, "_segmentation", None)
@@ -219,11 +248,13 @@ def diarize(wav: Path, pipeline_dir: Path, num: int | None,
 # ---------- распознавание ----------
 
 def transcribe(wav: Path, model_name: str, gigaam_dir: Path,
-               word_timestamps: bool) -> list[Segment]:
+               word_timestamps: bool, device) -> list[Segment]:
     import gigaam
 
-    # Файлы уже лежат в gigaam_dir, поэтому load_model их не скачивает
-    model = gigaam.load_model(model_name, device="cpu", download_root=str(gigaam_dir))
+    # Файлы уже лежат в gigaam_dir, поэтому load_model их не скачивает.
+    # Не на CPU GigaAM считает энкодер в fp16 — это его штатный режим для GPU.
+    # Нарезка на фрагменты (VAD pyannote) выполняется на том же устройстве.
+    model = gigaam.load_model(model_name, device=device, download_root=str(gigaam_dir))
     result = model.transcribe_longform(str(wav), word_timestamps=word_timestamps)
 
     segments = []
@@ -364,6 +395,9 @@ def main() -> None:
                    help=f"без разметки спикеров (то же, что {NO_DIARIZATION_ENV}=1)")
     p.add_argument("--threads", type=int, default=DEFAULT_THREADS,
                    help=f"потоки CPU (по умолчанию {DEFAULT_THREADS}); больше — не всегда быстрее")
+    p.add_argument("--device", choices=DEVICES, default="cpu",
+                   help="cpu — процессор (по умолчанию); xpu — видеочип Intel, "
+                        "нужна сборка PyTorch для XPU (см. README)")
     args = p.parse_args()
 
     diarization = not (args.no_diarization or env_flag(NO_DIARIZATION_ENV))
@@ -385,6 +419,7 @@ def main() -> None:
     import torch
     torch.set_num_threads(args.threads)
     log(f"Потоков CPU: {args.threads}")
+    device = select_device(args.device)
 
     fmt, output = resolve_output(args.input, args.output, args.format)
     t0 = time.time()
@@ -397,14 +432,15 @@ def main() -> None:
         turns = None
         if diarization:
             log("Диаризация (pyannote)...")
-            turns = diarize(wav, pipeline_dir, args.num_speakers,
-                            args.min_speakers, args.max_speakers, args.diarization_step)
+            turns = diarize(wav, pipeline_dir, args.num_speakers, args.min_speakers,
+                            args.max_speakers, args.diarization_step, device)
             log(f"  реплик: {len(turns)}, спикеров: {len({t[2] for t in turns})}")
         else:
             log("Диаризация отключена.")
 
         log(f"Распознавание ({args.model})...")
-        segments = transcribe(wav, args.model, gigaam_dir, word_timestamps=diarization)
+        segments = transcribe(wav, args.model, gigaam_dir,
+                              word_timestamps=diarization, device=device)
         log(f"  сегментов: {len(segments)}")
 
     if turns is not None:
